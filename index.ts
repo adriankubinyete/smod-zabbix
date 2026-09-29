@@ -1,0 +1,102 @@
+import type { Server } from "node:http";
+import { ChannelType } from "discord.js";
+import { modConfig } from "./settings";
+import { defineCog } from "@/define";
+import { Logger } from "@/utils/logging";
+import _zabbix from "./commands/zabbix";
+import { handleZabbixButtons } from "./discord/buttons";
+import { handleOperatorMessage } from "./discord/operatorCommands";
+import { ensureSeverityTags } from "./discord/severity";
+import { startIngestServer } from "./http/server";
+import { startArchiveJob, stopArchiveJob } from "./jobs/archiver";
+import {
+	reconcile,
+	startReconciliationJob,
+	stopReconciliationJob,
+} from "./jobs/reconciliation";
+import { ZABBIX_SCHEMA } from "./migrations";
+import * as repo from "./repository";
+
+const logger = new Logger("zabbix");
+
+let server: Server | null = null;
+
+/**
+ * Variáveis de deploy obrigatórias pra integração funcionar de verdade (ver src/config/index.ts).
+ * Canal Forum não entra aqui - é configurável via `/zabbix config canal-forum` em runtime, não
+ * precisa existir no boot (sem ele, threads só não se criam até alguém configurar).
+ */
+function isConfigured(): boolean {
+	return !!(
+		modConfig.webhookSecret &&
+		modConfig.apiUrl &&
+		modConfig.apiUser &&
+		modConfig.apiPassword
+	);
+}
+
+export default defineCog({
+	name: "zabbix",
+	description:
+		"Ponte operacional entre o Zabbix e o Discord - 1 evento de trigger = 1 thread.",
+	authors: [{ name: "Adrian", id: 0n }],
+
+	commands: [_zabbix],
+	migrations: [ZABBIX_SCHEMA],
+
+	events: {
+		// !ack/!finalizar/!sev viraram botões + select na primeira mensagem da thread (ver
+		// discord/buttons.ts) - só !mensagem continua também por texto, além do botão "Interagir".
+		async interactionCreate(client, interaction) {
+			await handleZabbixButtons(client, interaction).catch((err) => {
+				logger.error(err instanceof Error ? err : new Error(String(err)));
+			});
+		},
+		async messageCreate(client, message) {
+			await handleOperatorMessage(client, message).catch((err) => {
+				logger.error(err instanceof Error ? err : new Error(String(err)));
+			});
+		},
+	},
+
+	async start(client) {
+		if (!isConfigured()) {
+			logger.warn(
+				"Integração com o Zabbix não está totalmente configurada (variáveis MOD_ZABBIX_* faltando) - " +
+					"servidor de ingest e jobs não vão subir. Ver .dev/zabbix-module/CONTEXT.md.",
+			);
+			return;
+		}
+
+		server = startIngestServer(client);
+		startReconciliationJob(client);
+		startArchiveJob(client);
+
+		// Cobre o caso do bot ter ficado fora do ar desde o último tick - reconcilia uma vez já no
+		// arranque, não só espera o primeiro intervalo.
+		reconcile(client).catch((err) =>
+			logger.error(err instanceof Error ? err : new Error(String(err))),
+		);
+	},
+
+	async stop() {
+		if (server) {
+			await new Promise<void>((resolve) => server?.close(() => resolve()));
+			server = null;
+		}
+		stopReconciliationJob();
+		stopArchiveJob();
+	},
+
+	async onReady(client) {
+		const channelId = await repo.getForumChannelId();
+		if (!channelId) return;
+
+		const channel = await client.channels.fetch(channelId).catch(() => null);
+		if (channel?.type === ChannelType.GuildForum) {
+			await ensureSeverityTags(channel).catch((err) => {
+				logger.error(err instanceof Error ? err : new Error(String(err)));
+			});
+		}
+	},
+});
